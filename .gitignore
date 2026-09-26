@@ -4,6 +4,7 @@ data/
 # 个人申请记录
 applications.csv
 leetcode.csv
+topics_log.csv
 digests/
 outbox.md
 

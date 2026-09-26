@@ -1,0 +1,150 @@
+{
+  "_note": "「能讲清楚自己的代码」清单。全部来自 m1lage/study-log、intern-hunt、study-bot 的真实代码。面试官点进 GitHub 就会问这些。标准不是「读过」，是「能当场画图讲明白，并回答追问」。 进度不存在这个文件里 —— 见 topics_log.csv（不公开）。",
+  "_weekly_target": 3,
+  "topics": [
+    {
+      "id": "asyncio-why",
+      "repo": "study-bot",
+      "tier": 1,
+      "q": "bot.py 为什么用 asyncio？如果 on_message 里写同步的 subprocess.run 会发生什么？",
+      "must_cover": "事件循环单线程；阻塞调用会卡住所有人的消息；所以用 asyncio.to_thread 把 CLI 调用丢出去",
+      "where": "bot.py on_message / route_local"
+    },
+    {
+      "id": "to-thread",
+      "repo": "study-bot",
+      "tier": 1,
+      "q": "asyncio.to_thread 和 create_subprocess_exec 有什么区别？你在哪用了哪个，为什么？",
+      "must_cover": "to_thread 跑同步阻塞函数；create_subprocess_exec 是原生异步子进程。CLI 用前者，claude -p 用后者（要 timeout 控制）",
+      "where": "bot.py route_local vs ask_claude"
+    },
+    {
+      "id": "multiuser-env",
+      "repo": "study-bot",
+      "tier": 1,
+      "q": "多用户隔离是怎么实现的？为什么用环境变量 STUDY_ROOT，而不是给每个函数加一个 path 参数？",
+      "must_cover": "CLI 本身完全不知道 Discord 存在；一份代码 N 个数据目录；改参数要动几十个调用点",
+      "where": "study/bin/study 顶部 ROOT 定义 + bot.py run()"
+    },
+    {
+      "id": "perm-hole",
+      "repo": "study-bot",
+      "tier": 1,
+      "q": "那个权限漏洞具体是什么？你怎么发现的？怎么确认没泄露？怎么修的？",
+      "must_cover": "LLM fallback 有文件读取能力；群友试探；去翻 ~/.claude/projects 下的 session transcript 确认 cwd 边界挡住了；修法是非 owner 不进 fallback（纵深防御，不是补漏）",
+      "where": "bot.py on_message 里的 owner 判断"
+    },
+    {
+      "id": "onready-leak",
+      "repo": "study-bot",
+      "tier": 1,
+      "q": "on_ready 为什么会触发 34 次？导致了什么后果？你怎么定位的？",
+      "must_cover": "网关重连每次都触发 on_ready，不只是启动；每次 create_task 多一个发榜循环；靠 list_task_runs 的 started_at vs last_activity 差值 + 日志定位",
+      "where": "bot.py on_ready 的 _board_task 判断"
+    },
+    {
+      "id": "idempotency",
+      "repo": "study-bot",
+      "tier": 2,
+      "q": "修了 on_ready 之后为什么还要加 .last_board 日期戳？这不是重复保险吗？",
+      "must_cover": "纵深防御；任务守卫依赖内存状态，进程重启就没了；日期戳是持久的，就算漏一个循环也只发一条",
+      "where": "bot.py daily_leaderboard"
+    },
+    {
+      "id": "midnight-split",
+      "repo": "study-log",
+      "tier": 1,
+      "q": "跨午夜的 session 为什么必须拆？不拆会怎样？你怎么拆的？",
+      "must_cover": "22:28–01:00 全记到前一天 → 前一天虚高、后一天空白，两天的账都错；按 00:00 切成两条，题数记在长的那半",
+      "where": "bin/study cmd_done"
+    },
+    {
+      "id": "dup-guard",
+      "repo": "study-log",
+      "tier": 2,
+      "q": "为什么在写入层加内容相等的去重护栏？什么情况下会触发？",
+      "must_cover": "部署时两个 bot 进程同时跑，同一条 done 被处理两遍，时长翻倍；护栏在 append() 里比对完整 key",
+      "where": "bin/study append()"
+    },
+    {
+      "id": "evidence-gate",
+      "repo": "study-log",
+      "tier": 2,
+      "q": "为什么产出检查放在写入时拒绝，而不是记下来事后标记？",
+      "must_cover": "事后规则会被忽略；拒绝写入让成本立刻可见。这是设计决策不是技术限制，面试官会问你怎么想的",
+      "where": "bin/study cmd_done 开头"
+    },
+    {
+      "id": "weekly-settle",
+      "repo": "study-log",
+      "tier": 3,
+      "q": "为什么欠账按周结算而不是按天？1.5 倍系数是怎么想的？",
+      "must_cover": "按天结算 → 一天失败整个系统显得不值得继续；按周给了调配空间。1.5 倍让拖延有成本但不至于滚雪球",
+      "where": "bin/study debt_balance()"
+    },
+    {
+      "id": "name-normalize",
+      "repo": "intern-hunt",
+      "tier": 1,
+      "q": "公司名匹配为什么要归一化？短名为什么要精确匹配？举三个会出错的例子。",
+      "must_cover": "AMD 会匹配 Amdocs、SIG 会匹配 Signify Health、JPMorgan 匹配不上 JP Morgan Chase；归一化只留字母数字，≤4 字符的要求全等",
+      "where": "bin/intern _norm() / LOTTERY_SHORT"
+    },
+    {
+      "id": "hitrate-model",
+      "repo": "intern-hunt",
+      "tier": 1,
+      "q": "为什么按「命中率」而不是公司规模排序？举一个反直觉的例子。",
+      "must_cover": "指标是申请人数/岗位数。30 人的热门 AI startup 比 Google 还难进；批量招人的大投行反而好进。这是个建模判断，能聊出深度",
+      "where": "bin/intern score() 的 tier 分层"
+    },
+    {
+      "id": "weighted-score",
+      "repo": "intern-hunt",
+      "tier": 2,
+      "q": "18 个信号的权重是怎么定的？怎么验证排序是对的？",
+      "must_cover": "手调 + 看排序结果是否合理（sophomore program 从第 40 位升到第 1 位就是验证）。诚实承认没有 ground truth，这比编一个评估指标好",
+      "where": "config.json weights"
+    },
+    {
+      "id": "csv-choice",
+      "repo": "study-log",
+      "tier": 3,
+      "q": "为什么用 CSV 而不是 SQLite？什么情况下你会换？",
+      "must_cover": "单用户、几百行、要能手工编辑和 git diff；并发写或者要查询就该换。能讲清权衡比选对更重要",
+      "where": "bin/study 整体"
+    },
+    {
+      "id": "local-routing",
+      "repo": "study-bot",
+      "tier": 2,
+      "q": "为什么 90% 的流量走本地命令路由，只有听不懂的才给 LLM？",
+      "must_cover": "延迟（毫秒 vs 十几秒）+ 成本 + 确定性。打卡必须每次结果一样，LLM 不保证",
+      "where": "bot.py route_local() 的 STUDY_CMDS 表"
+    },
+    {
+      "id": "launchd",
+      "repo": "study-bot",
+      "tier": 3,
+      "q": "launchd 的 KeepAlive 做什么？token 失效那次为什么会变成问题？",
+      "must_cover": "崩溃自动重启；token 失效时变成无限崩溃重启循环，烧了 6 次才被发现；换 token 前要先 unload",
+      "where": "com.study-bot.plist.example"
+    },
+    {
+      "id": "cwd-boundary",
+      "repo": "study-bot",
+      "tier": 2,
+      "q": "为什么 claude -p 的子进程被 cwd 限制住了？这个边界可靠吗？",
+      "must_cover": "非交互模式默认不越 cwd 读文件。但不该依赖一个你不知道存在的边界 —— 这正是为什么要加显式的 owner 检查",
+      "where": "bot.py ask_claude 的 cwd 参数"
+    },
+    {
+      "id": "gitignore-trap",
+      "repo": "all",
+      "tier": 3,
+      "q": ".gitignore 为什么不能写行尾注释？你怎么发现的？",
+      "must_cover": "整行含注释被当成模式，config.json 因此漏进了暂存区；靠 git status 逐个核对发现的。小坑但能体现你会检查而不是假设",
+      "where": "三个仓库的 .gitignore"
+    }
+  ]
+}

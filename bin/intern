@@ -19,6 +19,8 @@ LISTINGS = os.path.join(DATA, "listings.json")
 STATE = os.path.join(DATA, "state.json")
 APPS = os.path.join(ROOT, "applications.csv")
 LEET = os.path.join(ROOT, "leetcode.csv")
+TOPICS = os.path.join(ROOT, "topics.json")
+TOPIC_LOG = os.path.join(ROOT, "topics_log.csv")
 OUTBOX = os.path.join(ROOT, "outbox.md")
 
 W = CFG["weights"]
@@ -526,6 +528,95 @@ def cmd_lc(args):
     return 0
 
 
+# ---------------- 项目讲解（fake it till you make it） ----------------
+
+TIER_NAME = {1: "必考", 2: "常问", 3: "加分"}
+
+
+def load_topics():
+    if not os.path.exists(TOPICS):
+        return {"topics": []}
+    with open(TOPICS) as f:
+        return json.load(f)
+
+
+def done_ids():
+    """已掌握的 id —— 从日志推导，不写回 topics.json。
+    清单是公开的静态文件；个人进度留在 gitignore 的 topics_log.csv 里。"""
+    if not os.path.exists(TOPIC_LOG):
+        return set()
+    with open(TOPIC_LOG) as f:
+        return {r["id"] for r in csv.DictReader(f)}
+
+
+def topic_week():
+    mon, _ = week_bounds()
+    if not os.path.exists(TOPIC_LOG):
+        return 0
+    with open(TOPIC_LOG) as f:
+        return len([r for r in csv.DictReader(f) if r["date"] >= mon])
+
+
+def cmd_topic(args):
+    """intern topic            看清单
+       intern topic <id>       标记"我能讲明白了"
+       intern topic next       下一个该攻的
+    """
+    ts = load_topics().get("topics", [])
+    have = done_ids()
+    for t in ts:
+        t["done"] = t["id"] in have
+    tgt = CFG["digest"].get("weekly_topic_target", 3)
+
+    if args and args[0] == "next":
+        todo = sorted([t for t in ts if not t["done"]], key=lambda t: t["tier"])
+        if not todo:
+            print("全部搞定了。")
+            return 0
+        t = todo[0]
+        print(f"\n【{TIER_NAME[t['tier']]}】{t['repo']}  —  {t['id']}\n")
+        print(f"  Q: {t['q']}\n")
+        print(f"  必须覆盖: {t['must_cover']}")
+        print(f"  代码位置: {t['where']}\n")
+        print(f"  讲明白了就跑: intern topic {t['id']}")
+        return 0
+
+    if args:
+        tid = args[0]
+        hit = [t for t in ts if t["id"] == tid]
+        if not hit:
+            print(f"没有这个 id: {tid}")
+            return 1
+        if tid in have:
+            print(f"（{tid} 之前已经标记过了）")
+            return 0
+        exists = os.path.exists(TOPIC_LOG)
+        with open(TOPIC_LOG, "a", newline="") as f:
+            w = csv.DictWriter(f, ["date", "id", "repo"])
+            if not exists:
+                w.writeheader()
+            w.writerow({"date": datetime.now().strftime("%Y-%m-%d"),
+                        "id": tid, "repo": hit[0]["repo"]})
+        print(f"✅ {tid} — {hit[0]['q'][:50]}")
+        have.add(tid)
+        for t in ts:
+            t["done"] = t["id"] in have
+
+    done = sum(1 for t in ts if t["done"])
+    wk = topic_week()
+    bar = "█" * round(done / max(1, len(ts)) * 12)
+    print(f"\n总进度 {bar}{'░' * (12 - len(bar))} {done}/{len(ts)}"
+          f"   ｜ 本周 {wk}/{tgt}")
+    for tier in (1, 2, 3):
+        grp = [t for t in ts if t["tier"] == tier]
+        if not grp:
+            continue
+        print(f"\n【{TIER_NAME[tier]}】")
+        for t in grp:
+            print(f"  [{'x' if t['done'] else ' '}] {t['id']:<18} {t['repo']:<12} {t['q'][:46]}")
+    return 0
+
+
 def cmd_apply(args):
     job, rest = resolve(args)
     note = " ".join(rest)
@@ -556,6 +647,9 @@ def cmd_status(args):
     print(f"累计申请：{len(rows)} · 本周 {len(this_week)}/{CFG['digest']['weekly_application_target']}")
     lcw, _ = lc_week()
     print(f"LeetCode ：本周 {lcw}/{CFG['digest']['weekly_leetcode_target']} 题")
+    td = load_topics().get("topics", [])
+    print(f"项目讲解：本周 {topic_week()}/{CFG['digest'].get('weekly_topic_target', 3)} 个"
+          f"  （总 {len(done_ids())}/{len(td)}）")
     print(f"上次抓取：{state.get('last_fetch') or '从未'}")
     if this_week:
         print("\n本周投的：")
@@ -574,6 +668,7 @@ def cmd_help(args):
   intern skip <编号>        这个不感兴趣，以后不推
   intern status             申请进度 + 池子状态
   intern lc <题数> <题目>    记 LeetCode（周目标 10 题）
+  intern topic [id|next]    项目讲解清单（周目标 3 个）
   intern say <消息>         发一条消息到实习频道（测 webhook）
 """)
     return 0
@@ -589,7 +684,7 @@ def cmd_say(args):
 
 CMDS = {"fetch": cmd_fetch, "digest": cmd_digest, "list": cmd_list,
         "apply": cmd_apply, "skip": cmd_skip, "status": cmd_status, "say": cmd_say,
-        "lc": cmd_lc, "刷题": cmd_lc,
+        "lc": cmd_lc, "刷题": cmd_lc, "topic": cmd_topic, "项目": cmd_topic,
         "help": cmd_help}
 
 if __name__ == "__main__":
