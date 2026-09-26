@@ -1,0 +1,14 @@
+# 抓取的岗位数据（13MB，来自 SimplifyJobs，不转载）
+data/
+
+# 个人申请记录
+applications.csv
+leetcode.csv
+digests/
+outbox.md
+
+# 含个人档案（姓名/学校/专业）；示例见 config.example.json
+config.json
+
+__pycache__/
+*.pyc

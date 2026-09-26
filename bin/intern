@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""intern — Summer 2027 实习匹配 + 每日推送
+
+用法见 README.md 或 `intern help`
+"""
+import csv
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CFG = json.load(open(os.path.join(ROOT, "config.json")))
+DATA = os.path.join(ROOT, "data")
+DIGESTS = os.path.join(ROOT, "digests")
+LISTINGS = os.path.join(DATA, "listings.json")
+STATE = os.path.join(DATA, "state.json")
+APPS = os.path.join(ROOT, "applications.csv")
+LEET = os.path.join(ROOT, "leetcode.csv")
+OUTBOX = os.path.join(ROOT, "outbox.md")
+
+W = CFG["weights"]
+TERM = CFG["term"]
+DREAMS = {c.lower() for c in CFG.get("dream_companies", [])}
+ITAR = {c.lower() for c in CFG.get("itar_companies", [])}
+def _norm(x):
+    """归一化公司名：只留字母数字。"JP Morgan Chase" / "J.P. Morgan" -> "jpmorganchase"/"jpmorgan" """
+    return re.sub(r"[^a-z0-9]", "", (x or "").lower())
+
+
+LOTTERY = {_norm(c) for c in CFG.get("lottery_companies", [])}
+LOTTERY_SHORT = {x for x in LOTTERY if len(x) <= 4}    # IMC/SIG/DRW/AMD：只许精确匹配
+LOTTERY_LONG = LOTTERY - LOTTERY_SHORT
+
+# ---------------- state ----------------
+
+def load_state():
+    if os.path.exists(STATE):
+        return json.load(open(STATE))
+    return {"seen": {}, "skipped": [], "last_fetch": None, "last_digest": None}
+
+
+def save_state(s):
+    json.dump(s, open(STATE, "w"), indent=1)
+
+
+def load_listings():
+    if not os.path.exists(LISTINGS):
+        sys.exit("还没抓数据，先跑 `intern fetch`")
+    return json.load(open(LISTINGS))
+
+
+# ---------------- scoring ----------------
+
+RE_AGENT = re.compile(r"\bagent(ic|s)?\b|\bLLM\b|generative ai|\bgenai\b|foundation model|\bRAG\b|multi-?modal|reasoning", re.I)
+RE_SWE = re.compile(r"software engineer|software developer|\bSWE\b|backend|back-end|frontend|front-end|full.?stack|platform engineer|infrastructure engineer|systems engineer|software intern|developer intern|engineering intern", re.I)
+RE_ML = re.compile(r"machine learning|\bML\b|\bAI\b|deep learning|data scien|applied scien|computer vision|\bNLP\b|MLE\b", re.I)
+# 面向低年级的项目名。刻意排除 "Insights"（商业分析岗大量误报）。
+# 强信号 = 明确限低年级；弱信号 = 银行/大厂对所有实习的统称，误报多，只轻微加分。
+RE_EARLY = re.compile(r"\bSTEP\b|\bExplore\b|\bDiscovery\b|\bsophomore\b|\bfreshman\b|first.?year|\brising\b|meta university|\bimmersion\b", re.I)
+RE_EARLY_WEAK = re.compile(r"early career|emerging talent|launchpad|\bpathways\b|\bpropel\b|\bEngage\b|undergraduate", re.I)
+RE_PHD = re.compile(r"\bPhD\b|doctoral|post-?doc", re.I)
+RE_RESEARCH = re.compile(r"research scientist|research intern|research engineer|scientist intern", re.I)
+RE_SENIOR = re.compile(r"\bsenior\b|\bstaff\b|\blead\b|\bprincipal\b|\bmanager\b", re.I)
+RE_CLEAR = re.compile(r"clearance|\bTS/SCI\b|secret|citizen|\bITAR\b|export control", re.I)
+RE_US = re.compile(r", [A-Z]{2}$|\bUSA\b|\bU\.S\.A?\b|United States", re.I)
+RE_HW = re.compile(r"\bsilicon\b|\bhardware\b|\bASIC\b|\bFPGA\b|\bRTL\b|\bVLSI\b|circuit|\bPCB\b|analog|\bRF\b|mechanical|electrical", re.I)
+RE_MIDWEST = re.compile(r"\b(IL|WI|IN|MO|MI|OH|IA|MN)\b|Chicago|Champaign|Urbana|"
+                        r"Illinois|Wisconsin|Indiana|Missouri|Michigan|Ohio|Iowa|Minnesota", re.I)
+RE_REMOTE = re.compile(r"remote", re.I)
+NON_US = re.compile(r"China|India|Canada|United Kingdom|\bUK\b|Singapore|Japan|Korea|Germany|France|Israel|Australia|Brazil|Mexico|Taiwan|Netherlands|Ireland|Poland|Spain|Sweden|Switzerland|ON,|BC,|QC,|AB,", re.I)
+
+
+def track_of(job):
+    t = job.get("title", "")
+    if RE_AGENT.search(t):
+        return "agent"
+    if RE_SWE.search(t):
+        return "swe"
+    if RE_ML.search(t):
+        return "ml"
+    return "other"
+
+
+def eligible(job):
+    """硬过滤：只留本科生能投的 Summer 2027 在招岗位"""
+    if not (job.get("active") and job.get("is_visible")):
+        return False
+    if TERM not in (job.get("terms") or []):
+        return False
+    degs = job.get("degrees") or []
+    if degs and "Bachelor's" not in degs:
+        return False  # Master's / PhD only
+    return True
+
+
+def score(job, now_ts):
+    t = job.get("title", "")
+    locs = " | ".join(job.get("locations") or [])
+    tr = track_of(job)
+    s = 0
+    flags = []
+
+    s += W.get(f"track_{tr}", 0)
+
+    co = job.get("company_name", "").strip().lower()
+
+    # 命中率分层：彩票厂扣分，其余全部加分。
+    # 判断标准是「申请人数/岗位数」而不是公司规模 ——
+    # 30 人的热门 AI startup 比 Google 还难进，所以它们也在彩票名单里。
+    con = _norm(co)
+    if con in LOTTERY_SHORT or any(con.startswith(x) for x in LOTTERY_LONG):
+        s += W.get("lottery_company", 0)
+        flags.append("🎰 彩票厂")
+        job["_tier"] = "lottery"
+    else:
+        s += W.get("reachable_company", 0)
+        flags.append("🎯 命中率高")
+        job["_tier"] = "reachable"
+
+    if co in DREAMS:
+        s += W.get("dream_company", 0)
+        flags.append("⭐ 目标公司")
+    if co in ITAR:
+        # 国防/航天承包商普遍要求 US Person（ITAR），国际学生基本卡死
+        s += W.get("itar_company", 0)
+        flags.append("🛑 ITAR/US Person")
+
+    if RE_EARLY.search(t):
+        s += W["early_program"]
+        flags.append("🟢 限低年级")
+    elif RE_EARLY_WEAK.search(t):
+        s += W["early_program_weak"]
+    degs = job.get("degrees") or []
+    if degs == ["Bachelor's"]:
+        s += W["bachelors_only"]
+
+    age_days = (now_ts - (job.get("date_posted") or 0)) / 86400
+    if age_days <= 7:
+        s += W["fresh_posting"]
+
+    # 只在有明确境外证据时才判境外。数据里 "SF" / "NYC" 这类简写不带州名，
+    # 反过来用"没匹配到美国格式就算境外"会把一大批 SF/NYC 的岗位误杀。
+    loc_list = job.get("locations") or []
+    us_locs = [l for l in loc_list if not NON_US.search(l)]
+    if loc_list and not us_locs:
+        s += W["non_us_location"]
+        flags.append("🌍 非美国地点")
+    elif any(RE_MIDWEST.search(l) for l in us_locs):
+        s += W["midwest_location"]
+    elif us_locs:
+        s += W["us_location"]
+    if RE_REMOTE.search(locs):
+        s += W["remote"]
+
+    if RE_HW.search(t):
+        s += W["hardware_title"]
+
+    if RE_PHD.search(t) or "PhD" in degs:
+        s += W["phd_title"]
+    if RE_RESEARCH.search(t):
+        s += W["research_title"]
+        flags.append("🔴 research 导向")
+    if RE_SENIOR.search(t):
+        s += W["senior_title"]
+    if RE_CLEAR.search(t):
+        s += W["clearance"]
+        flags.append("⚠️ 可能要身份/clearance")
+
+    return s, tr, flags
+
+
+def difficulty(job, tr, flags):
+    t = job.get("title", "")
+    if RE_EARLY.search(t):
+        return "🟢"
+    if RE_RESEARCH.search(t) or RE_PHD.search(t):
+        return "🔴"
+    if tr in ("agent", "ml"):
+        return "🟡"
+    return "🟡"
+
+
+def ranked(listings, state, include_skipped=False):
+    now_ts = datetime.now(timezone.utc).timestamp()
+    skipped = set(state.get("skipped", []))
+    applied = set(applied_ids())
+    out = []
+    for j in listings:
+        if not eligible(j):
+            continue
+        if not include_skipped and (j["id"] in skipped or j["id"] in applied):
+            continue
+        sc, tr, fl = score(j, now_ts)
+        if tr == "other" and sc < 20:
+            continue
+        out.append({"job": j, "score": sc, "track": tr, "flags": fl,
+                    "diff": difficulty(j, tr, fl)})
+    out.sort(key=lambda x: (-x["score"], -(x["job"].get("date_posted") or 0)))
+    return dedupe(out)
+
+
+def norm_title(t):
+    return re.sub(r"[^a-z0-9]+", "", re.sub(r"20\d\d", "", t.lower()))
+
+
+def dedupe(items):
+    """同一家公司的同名岗位常有多条记录（不同投递入口），只留分最高的那条"""
+    seen, out = set(), []
+    for it in items:
+        k = (it["job"]["company_name"].lower(), norm_title(it["job"]["title"]))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+    return out
+
+
+# ---------------- applications ----------------
+
+APP_FIELDS = ["date", "id", "company", "title", "url", "status", "note"]
+
+
+def applied_rows():
+    if not os.path.exists(APPS):
+        return []
+    with open(APPS) as f:
+        return list(csv.DictReader(f))
+
+
+def applied_ids():
+    return [r["id"] for r in applied_rows()]
+
+
+def add_application(job, status, note):
+    exists = os.path.exists(APPS)
+    with open(APPS, "a", newline="") as f:
+        w = csv.DictWriter(f, APP_FIELDS)
+        if not exists:
+            w.writeheader()
+        w.writerow({
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "id": job["id"],
+            "company": job["company_name"],
+            "title": job["title"],
+            "url": job.get("url", ""),
+            "status": status,
+            "note": note,
+        })
+
+
+# ---------------- discord ----------------
+
+def webhook_url():
+    p = os.path.expanduser(CFG["webhook_file"])
+    if not os.path.exists(p):
+        return None
+    u = open(p).read().strip()
+    return u if u.startswith(("https://discord.com/api/webhooks/",
+                              "https://discordapp.com/api/webhooks/")) else None
+
+
+def say(msg):
+    url = webhook_url()
+    if not url:
+        with open(OUTBOX, "a") as f:
+            f.write(f"\n---\n**{datetime.now():%Y-%m-%d %H:%M}** (webhook 未配置，已排队)\n{msg}\n")
+        print("[queued -> outbox.md] webhook 未配置")
+        return 1
+    for chunk in split_msg(msg):
+        r = subprocess.run(["curl", "-sS", "-X", "POST", "-H", "Content-Type: application/json",
+                            "-d", json.dumps({"content": chunk}), url],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            with open(OUTBOX, "a") as f:
+                f.write(f"\n---\n**{datetime.now():%Y-%m-%d %H:%M}** (发送失败，已排队)\n{chunk}\n")
+            print("发送失败:", r.stderr.strip()[:200])
+            return 1
+    print("sent -> discord")
+    return 0
+
+
+def split_msg(msg, limit=1900):
+    """按行切块，不截断内容"""
+    chunks, cur = [], ""
+    for line in msg.split("\n"):
+        if len(cur) + len(line) + 1 > limit:
+            chunks.append(cur.rstrip())
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur.rstrip())
+    return chunks or [""]
+
+
+# ---------------- commands ----------------
+
+def cmd_fetch(args):
+    os.makedirs(DATA, exist_ok=True)
+    tmp = LISTINGS + ".tmp"
+    r = subprocess.run(["curl", "-sSL", "--max-time", "120", "-o", tmp, CFG["source_url"]],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        print("抓取失败:", r.stderr.strip()[:200])
+        return 1
+    try:
+        new = json.load(open(tmp))
+    except json.JSONDecodeError as e:
+        os.remove(tmp)
+        print("数据损坏:", e)
+        return 1
+    state = load_state()
+    old_ids = set(state.get("seen", {}).keys())
+    os.replace(tmp, LISTINGS)
+
+    now = datetime.now().strftime("%Y-%m-%d")
+    fresh = []
+    for j in new:
+        if not eligible(j):
+            continue
+        if j["id"] not in old_ids:
+            fresh.append(j)
+        # 首次建库时按岗位真实发布日回填，避免把整个池子当成"今天新增"
+        posted = j.get("date_posted")
+        day = (datetime.fromtimestamp(posted).strftime("%Y-%m-%d")
+               if posted and not old_ids else now)
+        state["seen"].setdefault(j["id"], day)
+    state["last_fetch"] = datetime.now().isoformat(timespec="seconds")
+    save_state(state)
+    total = sum(1 for j in new if eligible(j))
+    first_run = not old_ids
+    print(f"抓到 {len(new)} 条，其中 {TERM} 本科生可投 {total} 条"
+          + ("（首次建库）" if first_run else f"，新增 {len(fresh)} 条"))
+    return 0
+
+
+def fmt_line(i, item, idx=True):
+    j = item["job"]
+    locs = (j.get("locations") or ["?"])[0]
+    extra = f" +{len(j['locations'])-1}" if len(j.get("locations") or []) > 1 else ""
+    tag = {"agent": "AGENT", "swe": "SWE", "ml": "ML", "other": "—"}[item["track"]]
+    head = f"`{i:>2}` " if idx else "• "
+    fl = (" " + " ".join(item["flags"])) if item["flags"] else ""
+    return (f"{head}{item['diff']} **{j['company_name']}** — {j['title'][:64]}\n"
+            f"　　{tag} · {locs}{extra} · {item['score']}分{fl}\n"
+            f"　　<{j.get('url','')}>")
+
+
+def cmd_list(args):
+    n = 15
+    if args and args[0].isdigit():
+        n = int(args[0])
+    track = None
+    for a in args:
+        if a in ("agent", "swe", "ml"):
+            track = a
+    items = ranked(load_listings(), load_state())
+    if track:
+        items = [x for x in items if x["track"] == track]
+    print(f"\n{TERM} 匹配池：{len(items)} 个（已排除跳过/已申请）\n")
+    for i, it in enumerate(items[:n], 1):
+        print(fmt_line(i, it).replace("`", "").replace("**", "").replace("<", "").replace(">", ""))
+        print()
+    return 0
+
+
+def week_bounds():
+    today = datetime.now()
+    mon = today - timedelta(days=today.weekday())
+    return mon.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+
+def one_per_company(items):
+    seen, out = set(), []
+    for it in items:
+        c = it["job"]["company_name"].lower()
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(it)
+    return out
+
+
+def cmd_digest(args):
+    push = "--push" in args or (CFG["digest"]["push"] and "--no-push" not in args)
+    listings = load_listings()
+    state = load_state()
+    items = ranked(listings, state)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    seen = state.get("seen", {})
+    # 昨天以来入库的
+    cutoff = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    new_items = [x for x in items if seen.get(x["job"]["id"], "") >= cutoff]
+
+    d = CFG["digest"]
+    lines = [f"## 🎯 Summer 2027 · {today}", ""]
+
+    if new_items:
+        lines.append(f"**新开 {len(new_items)} 个**（按匹配度）")
+        for i, it in enumerate(new_items[:d["new_max"]], 1):
+            lines.append(fmt_line(i, it))
+        lines.append("")
+    else:
+        lines.append("_今天没有新岗位入库。_\n")
+
+    # 按命中率分两区：小公司优先排前面，彩票厂留在后面「顺手投」。
+    # 不是不投大厂 —— 投一次成本很低、回报很高 —— 而是不让它们挤占前排注意力。
+    pool = one_per_company(items)
+    reach = [x for x in pool if x["job"].get("_tier") != "lottery"][:d["top_max"]]
+    lot = [x for x in pool if x["job"].get("_tier") == "lottery"][:d.get("lottery_max", 3)]
+
+    lines.append(f"**🎯 优先投这 {len(reach)} 个**（命中率高）")
+    for i, it in enumerate(reach, 1):
+        lines.append(fmt_line(i, it))
+    lines.append("")
+
+    if lot:
+        lines.append(f"**🎰 顺手投这 {len(lot)} 个**（彩票，别指望）")
+        for i, it in enumerate(lot, 1):
+            lines.append(fmt_line(i, it))
+        lines.append("")
+
+    # 梦校雷达：这些公司的 Summer 2027 还没出现在池子里 = 还没开放，等着
+    dreams = CFG.get("dream_companies", [])
+    pool_co = {j["company_name"].lower() for j in listings
+               if eligible(j)}
+    opened = [c for c in dreams if any(c.lower() in p for p in pool_co)]
+    waiting = [c for c in dreams if c not in opened]
+    lines.append(f"**梦校雷达**：{len(opened)}/{len(dreams)} 家已开")
+    if opened:
+        lines.append("　✅ 已开：" + "、".join(opened[:10]))
+    if waiting:
+        lines.append("　⏳ 还没动静：" + "、".join(waiting[:10])
+                     + (f" 等 {len(waiting)} 家" if len(waiting) > 10 else ""))
+    lines.append("")
+
+    # watchlist 命中
+    hits = [x for x in items if RE_EARLY.search(x["job"]["title"])]
+    lines.append(f"**低年级专项监控**：池中命中 {len(hits)} 个 🟢")
+    if hits:
+        for it in hits[:3]:
+            j = it["job"]
+            lines.append(f"　• {j['company_name']} — {j['title'][:60]}")
+    lines.append("")
+
+    # 本周进度
+    mon, _ = week_bounds()
+    this_week = [r for r in applied_rows() if r["date"] >= mon]
+    target = d["weekly_application_target"]
+    bar = "▰" * min(len(this_week), target) + "▱" * max(0, target - len(this_week))
+    lines.append(f"**本周申请** {len(this_week)}/{target}  {bar}")
+    if len(this_week) < target:
+        left = target - len(this_week)
+        lines.append(f"　还差 {left} 个。`intern apply <编号>` 记一笔。")
+    lines.append("")
+    lines.append(f"_池子共 {len(items)} 个可投 · `intern list` 看全部_")
+
+    msg = "\n".join(lines)
+    os.makedirs(DIGESTS, exist_ok=True)
+    path = os.path.join(DIGESTS, f"{today}.md")
+    open(path, "w").write(msg + "\n")
+    state["last_digest"] = today
+    save_state(state)
+    print(msg)
+    print(f"\n[saved] {path}")
+    if push:
+        say(msg)
+    return 0
+
+
+def resolve(args):
+    """编号或 id → job"""
+    if not args:
+        sys.exit("要个编号：`intern apply 3`")
+    items = ranked(load_listings(), load_state())
+    key = args[0]
+    if key.isdigit() and int(key) <= len(items):
+        return items[int(key) - 1]["job"], args[1:]
+    for it in items:
+        if it["job"]["id"].startswith(key):
+            return it["job"], args[1:]
+    sys.exit(f"找不到 {key}")
+
+
+# ---------------- leetcode ----------------
+
+LC_FIELDS = ["date", "count", "problems", "note"]
+
+
+def lc_rows():
+    if not os.path.exists(LEET):
+        return []
+    with open(LEET) as f:
+        return list(csv.DictReader(f))
+
+
+def lc_week():
+    mon, _ = week_bounds()
+    rows = [r for r in lc_rows() if r["date"] >= mon]
+    return sum(int(float(r["count"] or 0)) for r in rows), rows
+
+
+def cmd_lc(args):
+    """intern lc <题数> <题目...>  |  intern lc  (只看进度)"""
+    tgt = CFG["digest"]["weekly_leetcode_target"]
+    if args and args[0].lstrip("-").replace(".", "").isdigit():
+        n = int(float(args[0]))
+        problems = " ".join(args[1:])
+        exists = os.path.exists(LEET)
+        with open(LEET, "a", newline="") as f:
+            w = csv.DictWriter(f, LC_FIELDS)
+            if not exists:
+                w.writeheader()
+            w.writerow({"date": datetime.now().strftime("%Y-%m-%d"), "count": n,
+                        "problems": problems, "note": ""})
+        print(f"✅ +{n} 题" + (f" — {problems}" if problems else ""))
+    got, rows = lc_week()
+    bar_n = max(0, min(10, round(got / tgt * 10))) if tgt else 0
+    print(f"本周 {'█'*bar_n}{'░'*(10-bar_n)} {got}/{tgt} 题")
+    if rows and not args:
+        for r in rows:
+            print(f"  {r['date']}  {r['count']} 题  {r['problems'][:56]}")
+    return 0
+
+
+def cmd_apply(args):
+    job, rest = resolve(args)
+    note = " ".join(rest)
+    add_application(job, "applied", note)
+    print(f"✅ 记下了：{job['company_name']} — {job['title'][:60]}")
+    mon, _ = week_bounds()
+    n = len([r for r in applied_rows() if r["date"] >= mon])
+    print(f"本周第 {n} 个 / 目标 {CFG['digest']['weekly_application_target']}")
+    return 0
+
+
+def cmd_skip(args):
+    job, rest = resolve(args)
+    state = load_state()
+    state.setdefault("skipped", []).append(job["id"])
+    save_state(state)
+    print(f"🚫 以后不推：{job['company_name']} — {job['title'][:60]}")
+    return 0
+
+
+def cmd_status(args):
+    rows = applied_rows()
+    mon, _ = week_bounds()
+    this_week = [r for r in rows if r["date"] >= mon]
+    items = ranked(load_listings(), load_state())
+    state = load_state()
+    print(f"\n池子：{len(items)} 个可投 · 已跳过 {len(state.get('skipped', []))}")
+    print(f"累计申请：{len(rows)} · 本周 {len(this_week)}/{CFG['digest']['weekly_application_target']}")
+    lcw, _ = lc_week()
+    print(f"LeetCode ：本周 {lcw}/{CFG['digest']['weekly_leetcode_target']} 题")
+    print(f"上次抓取：{state.get('last_fetch') or '从未'}")
+    if this_week:
+        print("\n本周投的：")
+        for r in this_week:
+            print(f"  {r['date']}  {r['company']} — {r['title'][:52]}")
+    return 0
+
+
+def cmd_help(args):
+    print(__doc__)
+    print("""命令:
+  intern fetch              抓最新岗位，算出新增
+  intern digest [--no-push] 生成今日摘要（默认推 Discord）
+  intern list [n] [track]   看匹配池，track = agent|swe|ml
+  intern apply <编号> [备注] 记一笔申请
+  intern skip <编号>        这个不感兴趣，以后不推
+  intern status             申请进度 + 池子状态
+  intern lc <题数> <题目>    记 LeetCode（周目标 10 题）
+  intern say <消息>         发一条消息到实习频道（测 webhook）
+""")
+    return 0
+
+
+def cmd_say(args):
+    """发一条消息到实习频道（调试 webhook 用）"""
+    if not args:
+        print("用法: intern say <消息>")
+        return 1
+    return say(" ".join(args))
+
+
+CMDS = {"fetch": cmd_fetch, "digest": cmd_digest, "list": cmd_list,
+        "apply": cmd_apply, "skip": cmd_skip, "status": cmd_status, "say": cmd_say,
+        "lc": cmd_lc, "刷题": cmd_lc,
+        "help": cmd_help}
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else "help"
+    fn = CMDS.get(cmd)
+    if not fn:
+        sys.exit(f"没这个命令: {cmd}\n跑 `intern help`")
+    sys.exit(fn(argv[1:]))
